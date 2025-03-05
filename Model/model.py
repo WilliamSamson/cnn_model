@@ -9,6 +9,12 @@ import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
 
+def custom_collate(batch):
+    images, labels = zip(*batch)
+    images = torch.stack(images, 0)
+    # Keep labels as list so they can be processed individually
+    return images, list(labels)
+
 
 class LicensePlateDataset(Dataset):
     def __init__(self, csv_file, image_dir, char_to_index, img_transform=None):
@@ -40,9 +46,6 @@ class LicensePlateDataset(Dataset):
         encoded_label = self.encode_label(label)
         return image, torch.tensor(encoded_label, dtype=torch.long)
 
-# ------------------------------
-# 2. Data Module for PyTorch Lightning
-# ------------------------------
 class LicensePlateDataModule(pl.LightningDataModule):
     def __init__(self, csv_train, csv_val, image_dir, char_to_index, batch_size=16, img_transform=None):
         super().__init__()
@@ -58,14 +61,12 @@ class LicensePlateDataModule(pl.LightningDataModule):
         self.val_dataset = LicensePlateDataset(self.csv_val, self.image_dir, self.char_to_index, self.img_transform)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=custom_collate)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, collate_fn=custom_collate)
 
-# ------------------------------
-# 3. CRNN Model with CTC Loss
-# ------------------------------
+
 class CRNN(pl.LightningModule):
     def __init__(self, num_classes):
         super().__init__()
@@ -96,13 +97,16 @@ class CRNN(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, labels = batch
-        # Set constant input length (depends on CNN architecture, here assumed 32 time-steps)
-        input_lengths = torch.full((images.size(0),), 32, dtype=torch.long)
-        # Compute label lengths dynamically from the provided labels
-        label_lengths = torch.tensor([len(label) for label in labels], dtype=torch.long)
-
         predictions = self(images)
-        loss = self.ctc_loss(predictions.log_softmax(2), labels, input_lengths, label_lengths)
+        # T is the time steps from the model's output, expected to be 16.
+        T = predictions.shape[1]
+        input_lengths = torch.full((images.size(0),), T, dtype=torch.long)
+        label_lengths = torch.tensor([len(label) for label in labels], dtype=torch.long)
+        # Flatten the list of label tensors into one tensor
+        targets = torch.cat(labels)
+        # Transpose predictions to shape (T, batch, num_classes)
+        log_probs = predictions.log_softmax(2).transpose(0, 1)
+        loss = self.ctc_loss(log_probs, targets, input_lengths, label_lengths)
         self.log('train_loss', loss)
         return loss
 
@@ -143,3 +147,33 @@ model = CRNN(num_classes)
 # Setup PyTorch Lightning Trainer and start training
 trainer = pl.Trainer(max_epochs=20)
 trainer.fit(model, data_module)
+
+def decode_prediction(pred, index_to_char, blank_idx):
+    pred_texts = []
+    for p in pred:
+        p_idx = p.argmax(dim=1)  # shape: (T,)
+        prev = None
+        decoded = []
+        for idx in p_idx:
+            idx = idx.item()
+            if idx != blank_idx and idx != prev:
+                decoded.append(index_to_char[idx])
+            prev = idx
+        pred_texts.append("".join(decoded))
+    return pred_texts
+
+index_to_char = {i: char for char, i in char_to_index.items()}
+blank_idx = num_classes - 1
+
+model.eval()
+val_loader = data_module.val_dataloader()
+
+with torch.no_grad():
+    for batch in val_loader:
+        images, labels = batch
+        predictions = model(images)  # shape: (batch, T, num_classes)
+        pred_texts = decode_prediction(predictions, index_to_char, blank_idx)
+        true_texts = ["".join(index_to_char[i.item()] for i in label) for label in labels]
+        for true, pred in zip(true_texts, pred_texts):
+            print(f"True: {true} | Predicted: {pred}")
+        break  # Process one batch for demonstration
